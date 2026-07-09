@@ -48,7 +48,7 @@ This tool is written in Rust. You will need `cargo` (the Rust package manager) i
    *(The proxy will start on `http://127.0.0.1:8080` and print a temporary Root CA certificate to the terminal).*
 
 2. **Trust the Certificate:**
-   Save the printed `-----BEGIN CERTIFICATE----- ...` to a file called `ca.crt`.
+   Save the printed `-----BEGIN CERTIFICATE----- ...` to; end of certificate;  a file called `ca.crt`.
 
 3. **Run your Agent in the Sandbox:**
    In a new terminal window, route your agent through the proxy, point your PATH to the shim, and launch your agent inside the sandbox:
@@ -62,8 +62,8 @@ This tool is written in Rust. You will need `cargo` (the Rust package manager) i
    export PATH=$(pwd)/shim:$PATH
    
    # Launch the agent via the sandbox, allowing writes ONLY to ~/my_project
-   # (Replace "python my_agent.py" with whatever command you normally use to start your agent)
-   ./target/debug/Local_AI-Agent_Firewall_Proxy sandbox ~/my_project "python my_agent.py"
+   # (Replace python my_agent.py with whatever command you normally use to start your agent)
+   ./target/debug/Local_AI-Agent_Firewall_Proxy sandbox ~/my_project python my_agent.py
    ```
 
 ### How to run specific tools:
@@ -89,7 +89,7 @@ code .
 *Agent attempts:* `sh -c "rm -rf ~/.ssh"`
 *Firewall Output (waiting for your input):*
 ```text
-⚠️  Agent wants to run command:
+Agent wants to run command:
 > sh -c rm -rf ~/.ssh
 Approve? [y/N]: n
 [INFO] Command denied by user.
