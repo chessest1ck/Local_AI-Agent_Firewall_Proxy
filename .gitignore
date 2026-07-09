@@ -4,7 +4,7 @@
 # Local AI-Agent Firewall Proxy specific
 /shim/
 
-# dont every push these
+# dont ever push these
 #####################
 ca.crt
 ca.key
