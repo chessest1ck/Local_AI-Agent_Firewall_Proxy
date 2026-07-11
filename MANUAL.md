@@ -39,17 +39,30 @@ Welcome to the Local AI-Agent Firewall Proxy! This manual provides step-by-step 
 The tool operates using a single binary that handles three distinct modes based on how it is invoked:
 
 - **Mode 1: The Proxy Server (`cargo run`)**
-  Starts the MITM HTTP/HTTPS proxy on `127.0.0.1:8080`. It listens for web traffic to perform Deep Packet Inspection (DPI) and listens for internal API requests from the command shim.
+  Starts the MITM HTTP/HTTPS proxy on `127.0.0.1:8080`. It loads rules from `firewall_config.toml`, performs Deep Packet Inspection (DPI), enforces a 3-tier host filter (Allowlist, Threat Feed, User Prompt), prevents DNS rebinding, and listens for internal API requests from the command shim.
 
 - **Mode 2: The Command Shim (Invoked via symlink like `sh`)**
   When the binary is executed via a symlink named `sh` or `bash`, it operates as a shim. It reads the command arguments, forwards them to the running Proxy Server for user approval, and only executes the real `/bin/sh` if approved.
 
 - **Mode 3: The OS Sandbox (`Local_AI-Agent_Firewall_Proxy sandbox <workspace> <command>`)**
-  Dynamically generates a macOS Seatbelt (`.sb`) profile and launches the `<command>` inside a kernel-level sandbox that explicitly denies write access anywhere outside the `<workspace>`.
+  Dynamically generates a macOS Seatbelt (`.sb`) profile safely via `tempfile` and launches the `<command>` inside a kernel-level sandbox that explicitly denies write access anywhere outside the `<workspace>`.
 
 ---
 
-## 4. Step-by-Step Usage Guide (Worked Example)
+## 4. Configuration (`firewall_config.toml`)
+
+The proxy uses `firewall_config.toml` in the project root to control its behavior.
+Key settings:
+- **`[policy]`**: Controls the `unknown_host_action` ("prompt" or "block"), and features like `block_private_ips` (DNS rebinding defense).
+- **`[policy.allowlist]`**: List of auto-approved domains (e.g., `"api.openai.com"`). Supports automatic subdomain matching.
+- **`[policy.threat_feed]`**: Toggles the URLhaus malicious host blocklist and sets its auto-refresh interval.
+- **`[policy.dlp]`**: Configures Data Loss Prevention rules. You can define maximum payload sizes (`max_inspect_bytes`), whether to decompress payloads, and custom regex `[[policy.dlp.rules]]` to block sensitive data leakage (e.g. Prompt Injections, AWS Keys).
+
+*A sample configuration file can be found in `examples/firewall_config_sample.toml`.*
+
+---
+
+## 5. Step-by-Step Usage Guide (Worked Example)
 
 Here is a complete end-to-end example of securing a hypothetical agent called `claude`.
 
@@ -60,6 +73,7 @@ cargo run
 ```
 **Expected Output:**
 ```text
+[INFO] Loaded config from firewall_config.toml
 [INFO] Generating new temporary Root CA for MITM...
 ===================================================
 NEW ROOT CA GENERATED.
@@ -93,7 +107,7 @@ Still in **Terminal Window 2**, launch your agent inside the sandbox. We will gi
 If the agent attempts to run a dangerous command (e.g., `sh -c "rm -rf ~/.ssh"`), it will pause.
 Check **Terminal Window 1** (the proxy server). You will see:
 ```text
-Agent wants to run command:
+[WARNING] Agent wants to run command:
 > sh -c rm -rf ~/.ssh
 Approve? [y/N]: 
 ```
@@ -101,15 +115,16 @@ Type `n` and press Enter. The proxy will output `[INFO] Command denied by user.`
 
 ---
 
-## 5. Output Fields (Logs)
+## 6. Output Fields (Logs)
 The Proxy Server generates highly readable logs:
-- **`[INFO] Policy Engine (DLP): Blocked malicious prompt...`**: The Deep Packet Inspection detected a prompt injection or secret leakage and blocked the HTTP request.
+- **`[WARN] DLP blocked request...`**: The Deep Packet Inspection detected a prompt injection or secret leakage and blocked the HTTP request.
+- **`[WARN] Host blocked: 1.1.1.1...`**: The proxy blocked a direct IP connection or a malicious domain.
 - **`[WARN] NEW ROOT CA GENERATED`**: Prints the dynamic certificate needed to decrypt TLS traffic.
 - **`[INFO] Command approved/denied`**: The result of your interactive `y/N` terminal prompt.
 
 ---
 
-## 6. Troubleshooting
+## 7. Troubleshooting
 
 **Error: "Certificate verify failed" or "TLS Error" in Agent**
 - *Cause:* The agent does not trust the Proxy's temporary Root CA.
@@ -119,10 +134,10 @@ The Proxy Server generates highly readable logs:
 - *Cause:* The workspace path provided to the `sandbox` command does not exist.
 - *Fix:* Ensure the directory exists (e.g., `mkdir ~/my_project`) before launching the sandbox.
 
-**Error: "Command blocked by Local AI-Agent Firewall"**
-- *Cause:* The shim successfully contacted the proxy, and you typed `n` to deny the command.
-- *Fix:* If you intended to allow the command, run the agent again and type `y`.
+**Error: "No TTY — blocking unknown host (fail-closed)"**
+- *Cause:* An unknown host was encountered, but the proxy is running in the background without a terminal to prompt the user.
+- *Fix:* Run the proxy in a foreground terminal, or add the domain to `firewall_config.toml` allowlist.
 
 **Agent bypasses the interactive `y/N` prompt**
 - *Cause:* The agent is executing commands using absolute paths (e.g., calling `/bin/sh` directly instead of `sh`).
-- *Fix:* The shim relies on `$PATH`. If the agent hardcodes `/bin/sh`, the shim is bypassed. However, the OS Sandbox (Phase 4) still applies and will block malicious file writes regardless.
+- *Fix:* The shim relies on `$PATH`. If the agent hardcodes `/bin/sh`, the shim is bypassed. However, the OS Sandbox (Phase 3) still applies and will block malicious file writes regardless.

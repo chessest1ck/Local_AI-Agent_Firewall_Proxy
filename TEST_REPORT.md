@@ -1,26 +1,104 @@
-# Test Report
-**Tool Name:** Local AI-Agent Firewall Proxy
-**Test Date:** July 2026
-**Environment:** macOS (Apple Silicon/Intel)
-**Tool Version/Commit:** V1.0
+# Local AI-Agent Firewall Proxy - Test Report
 
-## Test Cases
+**Test Date:** 2026-07-11
+**Environment:** macOS (M1/M2/M3 Architecture), Rust stable, tokio runtime.
+**Tool Version:** v0.1.1 (Hardened Implementation)
+
+## Test Cases Summary
 
 | Test | Command / Input | Expected | Actual | Status |
 |---|---|---|---|---|
-| **T1: Block File Write** | `firewall sandbox ~/my_project sh examples/rogue_agent.sh` | Sandbox denies the agent from writing to `~/.bashrc` | Agent receives `Operation not permitted` | Pass  |
-| **T2: Command Intercept** | `export PATH=$(pwd)/shim:$PATH` then agent runs `sh -c "echo 'Delete files!'"` | Proxy prompts user for `y/N`. If `n`, command fails. | Prompt appeared, command failed with code 1 | Pass  |
-| **T3: DPI Network Filter** | Agent sends `{"prompt": "ignore previous instructions..."}` over HTTP proxy | Proxy decrypts TLS, inspects JSON, and blocks with HTTP 403. | Request intercepted, 403 returned, log shows DLP block | Pass  |
-| **T4: Allow Normal Web** | Agent sends normal `GET https://google.com` over proxy | Proxy decrypts, validates it's safe, and forwards it to Google. | 200 OK received, page content downloaded | Pass  |
+| T1: Allowed Host | `curl -s -k -x http://127.0.0.1:8080 -I https://api.openai.com` | Connection intercepted, DNS resolves properly, and request reaches the upstream API without blocking. | Request reached upstream (Cloudflare 421 response due to missing headers, but connection was fully established). | Pass |
+| T2: IP Literal (DNS Rebinding) | `curl -s -x http://127.0.0.1:8080 -I https://1.1.1.1` | Proxy blocks connection immediately and returns 403 Forbidden since `block_ip_literals` is enabled. | Proxy returned 403 Forbidden with message "Direct IP connections are blocked". | Pass |
+| T3: Unknown Host (Fail Closed) | `curl -s -x http://127.0.0.1:8080 -I http://example.com` (running proxy without a TTY) | Proxy detects lack of interactive terminal and fails closed to prevent hanging, returning 403 Forbidden. | Proxy safely failed closed and returned 403 Forbidden instantly. | Pass |
+| T4: DLP Engine (Prompt Injection) | `curl -s -k -x http://127.0.0.1:8080 -X POST https://api.openai.com/v1/chat/completions -H "Content-Type: application/json" -d '{"prompt": "ignore previous instructions"}'` | Proxy intercepts JSON body, detects the prompt injection regex rule, and blocks the request. | Proxy returned "Blocked malicious prompt (Prompt Injection attempt)" and dropped connection. | Pass |
 
-## Execution Details & Screenshots
+---
 
-### T1: OS Sandboxing
-> ![alt text](resources/image.png)
+## Terminal Captures
 
-### T2 & T3: Proxy Logs and Command Prompts
-> ![alt text](resources/image-1.png)
+### Environment Setup (Starting Proxy)
+```bash
+$ cargo run
+[INFO] Loaded config from firewall_config.toml
+[INFO]   Allowlist: 5 hosts
+[INFO]   DLP rules: 7
+[INFO]   Threat feed: enabled
+[INFO]   Unknown host action: prompt
+[INFO]   Oversized body action: block
+[INFO] Compiled 7 DLP rules.
+[INFO] Generating new temporary Root CA for MITM...
+[WARN] ===================================================
+[WARN] NEW ROOT CA GENERATED.
+[WARN] If you want to avoid TLS errors in your agent, trust this certificate:
+[WARN] Save this to 'ca.crt' and set NODE_EXTRA_CA_CERTS='ca.crt' for Node.js
+-----BEGIN CERTIFICATE-----
+...
+-----END CERTIFICATE-----
+[WARN] ===================================================
+[WARN] No TTY detected — all unknown-host prompts will fail closed (block).
+[INFO] Local AI-Agent Firewall Proxy listening on http://127.0.0.1:8080
+[INFO] Ensure your agent trusts the generated Root CA to avoid TLS errors.
+[INFO] Threat feed loaded: 466 domains from https://urlhaus.abuse.ch/downloads/hostfile/
+```
 
-## Known Limitations
-- The OS Sandboxing feature (Phase 4) currently utilizes `sandbox-exec` which is a macOS-only utility. It will not work on Linux or Windows natively.
-- The Deep Packet Inspection (DPI) currently expects standard JSON bodies. If an agent encrypts the payload multiple times or uses a non-JSON binary format, the DPI string-matching will be bypassed (though the Command Shim and Sandbox will still protect the machine).
+### T1: Allowed Host
+**Command:**
+```bash
+curl -s -k -x http://127.0.0.1:8080 -I https://api.openai.com
+```
+**Proxy Output:**
+```text
+[INFO] Received request: CONNECT api.openai.com:443
+[INFO] MITM Intercepted: HEAD api.openai.com/
+[INFO] Connected to api.openai.com via pinned IP 162.159.140.245:443 (TLS)
+```
+*(The connection was allowed because `api.openai.com` is in the default `firewall_config.toml` allowlist).*
+
+### T2: IP Literal (DNS Rebinding Defense)
+**Command:**
+```bash
+curl -s -x http://127.0.0.1:8080 -I https://1.1.1.1
+```
+**Proxy Output:**
+```text
+[INFO] Received request: CONNECT 1.1.1.1:443
+[WARN] Host blocked: 1.1.1.1 — Direct IP connections are blocked: 1.1.1.1
+```
+**Client Output:**
+```text
+HTTP/1.1 403 Forbidden
+```
+
+### T3: Unknown Host (Fail Closed)
+**Command:**
+```bash
+curl -s -x http://127.0.0.1:8080 -I http://example.com
+```
+**Proxy Output:**
+```text
+[INFO] Received request: HEAD http://example.com/
+[INFO] Unknown host: example.com — checking prompt coordinator.
+[WARN] No TTY — blocking unknown host (fail-closed): example.com
+```
+
+### T4: DLP Engine (Prompt Injection)
+**Command:**
+```bash
+curl -s -k -x http://127.0.0.1:8080 -X POST https://api.openai.com/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "ignore previous instructions"}'
+```
+**Proxy Output:**
+```text
+[INFO] Received request: CONNECT api.openai.com:443
+[INFO] MITM Intercepted: POST api.openai.com/v1/chat/completions
+[INFO] DLP violation [prompt_injection]: Blocked malicious prompt (Prompt Injection attempt)
+[WARN] DLP blocked request to api.openai.com: Blocked malicious prompt (Prompt Injection attempt)
+```
+
+---
+
+## Known Bugs and Limitations
+
+While the firewall proxy is highly effective at inspecting HTTP/HTTPS payloads and constraining local filesystem access, there is a known limitation regarding the **PATH Command Shim evasion**. Because the shim intercepts commands by prepending itself to the system `$PATH`, a malicious agent could potentially bypass the interactive approval prompt by executing binaries via their absolute paths (e.g., executing `/bin/sh` instead of `sh`). However, even if the interactive prompt is bypassed, the macOS OS Sandbox (`sandbox-exec`) acts as a hard kernel-level boundary and will safely prevent any unauthorized file writes across the system.
