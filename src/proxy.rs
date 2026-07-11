@@ -1,28 +1,45 @@
-use crate::policy::PolicyEngine;
+use crate::config::PolicyConfig;
+use crate::dns::{self, PinnedConnector};
+use crate::policy::{self, DlpAction, HostVerdict, PolicyEngine};
+use crate::prompt::{PromptCoordinator, PromptDecision};
 use crate::tls::MitmCa;
 use anyhow::Result;
 use bytes::Bytes;
 use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper::{Method, Request, Response, StatusCode, Uri};
-use hyper_util::client::legacy::Client;
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper::{Method, Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
 use std::sync::Arc;
-use tracing::{error, info};
+use std::time::Duration;
+use tracing::{debug, error, info, warn};
 
 pub struct ProxyHandler {
     policy_engine: Arc<PolicyEngine>,
     mitm_ca: Arc<MitmCa>,
+    prompt_coordinator: Arc<PromptCoordinator>,
+    pinned_connector: Arc<PinnedConnector>,
+    prompt_timeout: Duration,
+    block_private_ips: bool,
 }
 
 impl ProxyHandler {
-    pub fn new(policy_engine: Arc<PolicyEngine>, mitm_ca: Arc<MitmCa>) -> Self {
-        Self {
+    pub fn new(
+        policy_engine: Arc<PolicyEngine>,
+        mitm_ca: Arc<MitmCa>,
+        prompt_coordinator: Arc<PromptCoordinator>,
+        policy_config: &PolicyConfig,
+    ) -> Result<Self> {
+        let pinned_connector = Arc::new(PinnedConnector::new()?);
+
+        Ok(Self {
             policy_engine,
             mitm_ca,
-        }
+            prompt_coordinator,
+            pinned_connector,
+            prompt_timeout: Duration::from_secs(policy_config.prompt_timeout_secs),
+            block_private_ips: policy_config.block_private_ips,
+        })
     }
 
     pub async fn handle_request(
@@ -34,106 +51,206 @@ impl ProxyHandler {
         if Method::CONNECT == req.method() {
             self.handle_connect(req).await
         } else {
-            self.handle_http(req, None).await
+            self.handle_http(req).await
         }
     }
+
+    // ── CONNECT (HTTPS tunnel) ──────────────────────────────────
 
     async fn handle_connect(
         &self,
         req: Request<hyper::body::Incoming>,
     ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
-        if let Some(addr) = req.uri().authority().map(|a| a.to_string()) {
-            let host = addr.split(':').next().unwrap_or(&addr).to_string();
-
-            if !self.policy_engine.is_host_allowed(&host) {
+        let raw_authority = match req.uri().authority() {
+            Some(a) => a.to_string(),
+            None => {
                 return Ok(Response::builder()
-                    .status(StatusCode::FORBIDDEN)
-                    .body(empty())
-                    .unwrap());
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(full_body("Missing authority in CONNECT request"))
+                    .expect("response builder"));
+            }
+        };
+
+        // Parse authority
+        let (raw_host, port) = match policy::parse_authority(&raw_authority) {
+            Ok(hp) => hp,
+            Err(e) => {
+                warn!("Malformed authority '{}': {}", raw_authority, e);
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(full_body("Malformed authority"))
+                    .expect("response builder"));
+            }
+        };
+        let port = port.unwrap_or(443);
+
+        // Normalize host
+        let host = match policy::normalize_host(&raw_host) {
+            Ok(h) => h,
+            Err(e) => {
+                warn!("Invalid hostname '{}': {}", raw_host, e);
+                return Ok(forbidden_response(&format!("Invalid hostname: {}", e)));
+            }
+        };
+
+        // Check host through 3-tier policy
+        match self.check_host_with_prompt(&host).await {
+            Ok(true) => {} // allowed
+            Ok(false) => return Ok(forbidden_response("Host blocked by policy")),
+            Err(reason) => return Ok(forbidden_response(&reason)),
+        }
+
+        // DNS rebinding check — resolve and validate before connecting
+        if self.block_private_ips
+            && let Err(e) = dns::resolve_and_validate(&host, port).await {
+                warn!("DNS validation failed for {}: {}", host, e);
+                return Ok(forbidden_response(&format!("{}", e)));
             }
 
-            let mitm_ca = self.mitm_ca.clone();
-            let policy = self.policy_engine.clone();
-            let host_clone = host.clone();
+        let mitm_ca = self.mitm_ca.clone();
+        let policy = self.policy_engine.clone();
+        let pinned_connector = self.pinned_connector.clone();
+        let host_clone = host.clone();
+        let block_private_ips = self.block_private_ips;
 
-            tokio::task::spawn(async move {
-                match hyper::upgrade::on(req).await {
-                    Ok(upgraded) => {
-                        let io = TokioIo::new(upgraded);
-                        // Start MITM
-                        if let Ok(acceptor) = mitm_ca.get_acceptor(&host_clone) {
-                            match acceptor.accept(io).await {
-                                Ok(tls_stream) => {
-                                    let tls_io = TokioIo::new(tls_stream);
-                                    let host_for_inner = host_clone.clone();
-                                    
-                                    // Start a nested HTTP server for the decrypted traffic
-                                    let service = service_fn(move |inner_req| {
-                                        let policy = policy.clone();
-                                        let h = host_for_inner.clone();
-                                        async move {
-                                            handle_decrypted_request(inner_req, h, policy).await
-                                        }
-                                    });
+        tokio::task::spawn(async move {
+            match hyper::upgrade::on(req).await {
+                Ok(upgraded) => {
+                    let io = TokioIo::new(upgraded);
+                    // Start MITM
+                    if let Ok(acceptor) = mitm_ca.get_acceptor(&host_clone) {
+                        match acceptor.accept(io).await {
+                            Ok(tls_stream) => {
+                                let tls_io = TokioIo::new(tls_stream);
+                                let host_for_inner = host_clone.clone();
 
-                                    if let Err(e) = http1::Builder::new()
-                                        .preserve_header_case(true)
-                                        .title_case_headers(true)
-                                        .serve_connection(tls_io, service)
+                                let service = service_fn(move |inner_req| {
+                                    let policy = policy.clone();
+                                    let h = host_for_inner.clone();
+                                    let connector = pinned_connector.clone();
+                                    async move {
+                                        handle_decrypted_request(
+                                            inner_req,
+                                            h,
+                                            policy,
+                                            connector,
+                                            block_private_ips,
+                                        )
                                         .await
-                                    {
-                                        error!("Failed to serve MITM connection: {:?}", e);
                                     }
+                                });
+
+                                if let Err(e) = http1::Builder::new()
+                                    .preserve_header_case(true)
+                                    .title_case_headers(true)
+                                    .serve_connection(tls_io, service)
+                                    .await
+                                {
+                                    error!("Failed to serve MITM connection: {:?}", e);
                                 }
-                                Err(e) => error!("TLS accept error for {}: {}", host_clone, e),
                             }
+                            Err(e) => error!("TLS accept error for {}: {}", host_clone, e),
                         }
                     }
-                    Err(e) => error!("Upgrade error: {}", e),
                 }
-            });
+                Err(e) => error!("Upgrade error: {}", e),
+            }
+        });
 
-            Ok(Response::new(empty()))
-        } else {
-            Ok(Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(empty())
-                .unwrap())
-        }
+        Ok(Response::new(empty()))
     }
+
+    // ── Plain HTTP ──────────────────────────────────────────────
 
     async fn handle_http(
         &self,
         req: Request<hyper::body::Incoming>,
-        _override_host: Option<String>,
     ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
+        // Handle firewall command API (from shim)
         if req.uri().path() == "/api/firewall/command" && req.method() == Method::POST {
             return self.handle_firewall_command(req).await;
         }
 
-        let host = req.uri().host().unwrap_or("unknown");
-        if !self.policy_engine.is_host_allowed(host) {
-            return Ok(Response::builder()
-                .status(StatusCode::FORBIDDEN)
-                .body(empty())
-                .unwrap());
+        let raw_host = req.uri().host().unwrap_or("unknown");
+        let port = req.uri().port_u16().unwrap_or(80);
+
+        let host = match policy::normalize_host(raw_host) {
+            Ok(h) => h,
+            Err(e) => {
+                warn!("Invalid hostname '{}': {}", raw_host, e);
+                return Ok(forbidden_response(&format!("Invalid hostname: {}", e)));
+            }
+        };
+
+        // 3-tier host check
+        match self.check_host_with_prompt(&host).await {
+            Ok(true) => {}
+            Ok(false) => return Ok(forbidden_response("Host blocked by policy")),
+            Err(reason) => return Ok(forbidden_response(&reason)),
         }
 
-        // Just a basic forward for unencrypted HTTP
-        let client = Client::builder(TokioExecutor::new()).build_http();
+        // DNS rebinding check
+        if self.block_private_ips
+            && let Err(e) = dns::resolve_and_validate(&host, port).await {
+                warn!("DNS validation failed for {}: {}", host, e);
+                return Ok(forbidden_response(&format!("{}", e)));
+            }
+
+        // Forward plain HTTP via pinned connection
+        let addr = match dns::resolve_and_validate(&host, port).await {
+            Ok(a) => a,
+            Err(e) => {
+                error!("DNS resolution failed for {}: {}", host, e);
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .body(full_body(&format!("DNS resolution failed: {}", e)))
+                    .expect("response builder"));
+            }
+        };
+
+        let tcp = match self.pinned_connector.connect_tcp(addr, &host).await {
+            Ok(t) => t,
+            Err(e) => {
+                error!("TCP connect failed for {}: {}", host, e);
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .body(empty())
+                    .expect("response builder"));
+            }
+        };
+
+        let io = TokioIo::new(tcp);
+        let (mut sender, conn) = match hyper::client::conn::http1::handshake(io).await {
+            Ok(sc) => sc,
+            Err(e) => {
+                error!("HTTP handshake failed for {}: {}", host, e);
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .body(empty())
+                    .expect("response builder"));
+            }
+        };
+
+        tokio::task::spawn(async move {
+            if let Err(e) = conn.await {
+                error!("HTTP connection error: {}", e);
+            }
+        });
+
         let req = req.map(|b| b.boxed());
-        
-        match client.request(req).await {
+        match sender.send_request(req).await {
             Ok(res) => Ok(res.map(|b| b.boxed())),
             Err(e) => {
-                error!("Client request error: {}", e);
+                error!("HTTP request failed for {}: {}", host, e);
                 Ok(Response::builder()
-                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .status(StatusCode::BAD_GATEWAY)
                     .body(empty())
-                    .unwrap())
+                    .expect("response builder"))
             }
         }
     }
+
+    // ── Firewall command endpoint (shim) ────────────────────────
 
     async fn handle_firewall_command(
         &self,
@@ -143,13 +260,21 @@ impl ProxyHandler {
             Ok(b) => b.to_bytes(),
             Err(e) => {
                 error!("Failed to read firewall command body: {}", e);
-                return Ok(Response::builder().status(StatusCode::BAD_REQUEST).body(empty()).unwrap());
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(empty())
+                    .expect("response builder"));
             }
         };
 
         let payload: serde_json::Value = match serde_json::from_slice(&body_bytes) {
             Ok(v) => v,
-            Err(_) => return Ok(Response::builder().status(StatusCode::BAD_REQUEST).body(empty()).unwrap())
+            Err(_) => {
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(empty())
+                    .expect("response builder"));
+            }
         };
 
         let command_args = payload
@@ -160,36 +285,146 @@ impl ProxyHandler {
             .filter_map(|v| v.as_str())
             .collect::<Vec<_>>()
             .join(" ");
-        
-        let approved = tokio::task::spawn_blocking(move || {
-            use std::io::Write;
-            println!("\n\x1b[33m⚠️  Agent wants to run command:\x1b[0m\n> \x1b[1m{}\x1b[0m", command_args);
-            print!("Approve? [y/N]: ");
-            let _ = std::io::stdout().flush();
-            let mut input = String::new();
-            if std::io::stdin().read_line(&mut input).is_ok() {
-                input.trim().eq_ignore_ascii_case("y")
-            } else {
-                false
-            }
-        }).await.unwrap_or(false);
+
+        // Use the prompt coordinator for command approval too
+        let approved = if !self.prompt_coordinator.has_tty() {
+            warn!("No TTY — blocking command execution (fail-closed): {}", command_args);
+            false
+        } else {
+            // For commands, use a spawn_blocking with direct stdin since
+            // the prompt coordinator is designed for host prompts.
+            // Command prompts have a different format.
+            tokio::task::spawn_blocking(move || {
+                use std::io::Write;
+                eprintln!(
+                    "\n\x1b[33m[WARNING] Agent wants to run command:\x1b[0m\n> \x1b[1m{}\x1b[0m",
+                    command_args
+                );
+                eprint!("Approve? [\x1b[32my\x1b[0m/\x1b[31mN\x1b[0m]: ");
+                let _ = std::io::stderr().flush();
+                let mut input = String::new();
+                if std::io::stdin().read_line(&mut input).is_ok() {
+                    input.trim().eq_ignore_ascii_case("y")
+                } else {
+                    false
+                }
+            })
+            .await
+            .unwrap_or(false)
+        };
 
         if approved {
             info!("Command approved by user.");
             Ok(Response::new(empty()))
         } else {
             info!("Command denied by user.");
-            Ok(Response::builder().status(StatusCode::FORBIDDEN).body(empty()).unwrap())
+            Ok(Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body(empty())
+                .expect("response builder"))
+        }
+    }
+
+    // ── Host check with interactive prompt ──────────────────────
+
+    /// Checks a normalized host through the 3-tier system.
+    /// Returns Ok(true) to allow, Ok(false) to silently block,
+    /// Err(reason) with a specific block reason.
+    async fn check_host_with_prompt(&self, host: &str) -> Result<bool, String> {
+        match self.policy_engine.check_host(host) {
+            HostVerdict::Allowed => {
+                debug!("Host allowed (allowlist): {}", host);
+                Ok(true)
+            }
+            HostVerdict::Blocked(reason) => {
+                warn!("Host blocked: {} — {}", host, reason);
+                Err(reason)
+            }
+            HostVerdict::Unknown => {
+                info!("Unknown host: {} — checking prompt coordinator.", host);
+
+                if !self.prompt_coordinator.has_tty() {
+                    warn!("No TTY — blocking unknown host (fail-closed): {}", host);
+                    return Err(format!(
+                        "No TTY available — unknown host blocked (fail-closed): {}",
+                        host
+                    ));
+                }
+
+                // Send prompt request via channel
+                let response_rx = match self
+                    .prompt_coordinator
+                    .request_prompt_async(host.to_string())
+                    .await
+                {
+                    Some(rx) => rx,
+                    None => {
+                        warn!("Prompt coordinator unavailable — fail closed: {}", host);
+                        return Err("Prompt coordinator unavailable".to_string());
+                    }
+                };
+
+                // Await with timeout
+                match tokio::time::timeout(self.prompt_timeout, response_rx).await {
+                    Ok(Ok(PromptDecision::AllowOnce)) => {
+                        info!("User allowed (once): {}", host);
+                        Ok(true)
+                    }
+                    Ok(Ok(PromptDecision::AllowAlways)) => {
+                        info!("User allowed (always): {}", host);
+                        self.policy_engine.add_runtime_allowlist(host);
+                        Ok(true)
+                    }
+                    Ok(Ok(PromptDecision::Deny)) => {
+                        info!("User denied: {}", host);
+                        Ok(false)
+                    }
+                    Ok(Err(_)) => {
+                        // oneshot sender dropped — coordinator thread issue
+                        warn!("Prompt channel closed for {} — denying.", host);
+                        Ok(false)
+                    }
+                    Err(_) => {
+                        // Timeout — the oneshot receiver is dropped here,
+                        // coordinator will see the send fail and discard.
+                        warn!(
+                            "Prompt timed out after {}s — blocking: {}",
+                            self.prompt_timeout.as_secs(),
+                            host
+                        );
+                        Err(format!(
+                            "Prompt timed out after {}s — host blocked",
+                            self.prompt_timeout.as_secs()
+                        ))
+                    }
+                }
+            }
         }
     }
 }
 
+// ── Decrypted (MITM) request handler ────────────────────────────
+
 async fn handle_decrypted_request(
-    mut req: Request<hyper::body::Incoming>,
+    req: Request<hyper::body::Incoming>,
     host: String,
     policy: Arc<PolicyEngine>,
+    pinned_connector: Arc<PinnedConnector>,
+    _block_private_ips: bool,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
     info!("MITM Intercepted: {} {}{}", req.method(), host, req.uri());
+
+    // Extract headers we need before consuming the body
+    let content_type = req
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let content_encoding = req
+        .headers()
+        .get("content-encoding")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
 
     // Read the body
     let (parts, body) = req.into_parts();
@@ -200,61 +435,125 @@ async fn handle_decrypted_request(
             return Ok(Response::builder()
                 .status(StatusCode::BAD_REQUEST)
                 .body(empty())
-                .unwrap());
+                .expect("response builder"));
         }
     };
 
     // DLP Check
-    if !policy.inspect_json_payload(&body_bytes) {
-        return Ok(Response::builder()
-            .status(StatusCode::FORBIDDEN)
-            .body(Full::new(Bytes::from("Blocked by Local AI Firewall (DLP)")).map_err(|e| match e {}).boxed())
-            .unwrap());
+    match policy.inspect_body(
+        &body_bytes,
+        content_type.as_deref(),
+        content_encoding.as_deref(),
+    ) {
+        Ok(violations) if !violations.is_empty() => {
+            let reasons: Vec<String> = violations.iter().map(|v| v.message.clone()).collect();
+            let reason = reasons.join("; ");
+            warn!("DLP blocked request to {}: {}", host, reason);
+            return Ok(Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body(full_body(&format!("Blocked by Local AI Firewall (DLP): {}", reason)))
+                .expect("response builder"));
+        }
+        Err(DlpAction::BlockOversized) => {
+            warn!("DLP blocked oversized request to {}", host);
+            return Ok(Response::builder()
+                .status(StatusCode::PAYLOAD_TOO_LARGE)
+                .body(full_body("Request body too large for DLP inspection"))
+                .expect("response builder"));
+        }
+        _ => {} // No violations or pass-through
     }
 
-    // Reconstruct URI to point to the real HTTPS server
-    let mut uri_builder = Uri::builder().scheme("https").authority(host.as_str());
-    if let Some(path_and_query) = parts.uri.path_and_query() {
-        uri_builder = uri_builder.path_and_query(path_and_query.clone());
-    }
-    let new_uri = uri_builder.build().unwrap_or_else(|_| parts.uri.clone());
+    // DNS resolve + validate + connect to pinned IP
+    let port = 443;
+    let addr = match dns::resolve_and_validate(&host, port).await {
+        Ok(a) => a,
+        Err(e) => {
+            error!("DNS validation failed for {}: {}", host, e);
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(full_body(&format!("{}", e)))
+                .expect("response builder"));
+        }
+    };
 
-    let mut new_req = Request::builder()
+    // Connect via pinned connector (TLS with SNI = hostname)
+    let tls_stream = match pinned_connector.connect_tls(addr, &host).await {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Upstream TLS connect failed for {}: {}", host, e);
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(empty())
+                .expect("response builder"));
+        }
+    };
+
+    let io = TokioIo::new(tls_stream);
+    let (mut sender, conn) = match hyper::client::conn::http1::handshake(io).await {
+        Ok(sc) => sc,
+        Err(e) => {
+            error!("HTTP handshake over TLS failed for {}: {}", host, e);
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(empty())
+                .expect("response builder"));
+        }
+    };
+
+    tokio::task::spawn(async move {
+        if let Err(e) = conn.await {
+            error!("HTTPS connection error: {}", e);
+        }
+    });
+
+    // Reconstruct request
+    let mut builder = Request::builder()
         .method(parts.method)
-        .uri(new_uri)
-        .version(parts.version);
-    
+        .uri(parts.uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/"));
+
     for (k, v) in parts.headers.iter() {
-        new_req = new_req.header(k, v);
+        builder = builder.header(k, v);
+    }
+    // Ensure Host header is set
+    if !parts.headers.contains_key("host") {
+        builder = builder.header("host", &host);
     }
 
-    let body_to_send = Full::new(body_bytes).map_err(|never| match never {}).boxed();
-    let reconstructed_req = new_req.body(body_to_send).unwrap();
+    let body_to_send = Full::new(body_bytes)
+        .map_err(|never| match never {})
+        .boxed();
+    let reconstructed_req = builder.body(body_to_send).expect("request builder");
 
-    // Send to upstream HTTPS server
-    // Build an HTTPS client
-    let https = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_native_roots()
-        .expect("no native roots found")
-        .https_only()
-        .enable_http1()
-        .build();
-    let client: Client<hyper_rustls::HttpsConnector<HttpConnector>, BoxBody<Bytes, hyper::Error>> = Client::builder(TokioExecutor::new()).build(https);
-
-    match client.request(reconstructed_req).await {
+    match sender.send_request(reconstructed_req).await {
         Ok(res) => Ok(res.map(|b| b.boxed())),
         Err(e) => {
-            error!("Upstream HTTPS request failed: {}", e);
+            error!("Upstream HTTPS request failed for {}: {}", host, e);
             Ok(Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
                 .body(empty())
-                .unwrap())
+                .expect("response builder"))
         }
     }
 }
+
+// ── Helpers ─────────────────────────────────────────────────────
 
 fn empty() -> BoxBody<Bytes, hyper::Error> {
     Empty::<Bytes>::new()
         .map_err(|never| match never {})
         .boxed()
+}
+
+fn full_body(msg: &str) -> BoxBody<Bytes, hyper::Error> {
+    Full::new(Bytes::from(msg.to_string()))
+        .map_err(|never| match never {})
+        .boxed()
+}
+
+fn forbidden_response(reason: &str) -> Response<BoxBody<Bytes, hyper::Error>> {
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .body(full_body(reason))
+        .expect("response builder")
 }

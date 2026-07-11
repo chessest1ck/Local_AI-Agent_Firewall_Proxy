@@ -1,21 +1,24 @@
 use anyhow::{Context, Result};
-use rcgen::{CertificateParams, KeyPair, DistinguishedName, DnType, Issuer};
+use dashmap::DashMap;
+use rcgen::{CertificateParams, DistinguishedName, DnType, Issuer, KeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
 use std::sync::Arc;
 use tokio_rustls::TlsAcceptor;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 pub struct MitmCa {
     ca_params: CertificateParams,
     ca_key_pair: KeyPair,
     ca_cert_der: CertificateDer<'static>,
+    /// Cache of per-domain TLS server configs to avoid repeated key generation.
+    cert_cache: DashMap<String, Arc<ServerConfig>>,
 }
 
 impl MitmCa {
     pub fn new() -> Result<Self> {
         info!("Generating new temporary Root CA for MITM...");
-        
+
         let mut params = CertificateParams::default();
         let mut dn = DistinguishedName::new();
         dn.push(DnType::OrganizationName, "Local AI-Agent Firewall Proxy");
@@ -46,10 +49,14 @@ impl MitmCa {
             ca_params: params,
             ca_key_pair: key_pair,
             ca_cert_der,
+            cert_cache: DashMap::new(),
         })
     }
 
-    pub fn issue_cert(&self, domain: &str) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    pub fn issue_cert(
+        &self,
+        domain: &str,
+    ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
         let mut params = CertificateParams::new(vec![domain.to_string()])?;
         let mut dn = DistinguishedName::new();
         dn.push(DnType::OrganizationName, "Local AI-Agent Firewall Proxy MITM");
@@ -57,10 +64,10 @@ impl MitmCa {
         params.distinguished_name = dn;
 
         let key_pair = KeyPair::generate()?;
-        
+
         let issuer = Issuer::from_params(&self.ca_params, &self.ca_key_pair);
         let cert = params.signed_by(&key_pair, &issuer)?;
-        
+
         let key_der = key_pair.serialize_der();
 
         let cert_chain = vec![
@@ -68,19 +75,31 @@ impl MitmCa {
             self.ca_cert_der.clone(),
         ];
 
-        let private_key = PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(key_der));
+        let private_key =
+            PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(key_der));
 
         Ok((cert_chain, private_key))
     }
 
     pub fn get_acceptor(&self, domain: &str) -> Result<TlsAcceptor> {
+        // Check cache first
+        if let Some(cached) = self.cert_cache.get(domain) {
+            debug!("TLS cert cache hit for: {}", domain);
+            return Ok(TlsAcceptor::from(cached.clone()));
+        }
+
+        // Cache miss — generate new cert
+        debug!("TLS cert cache miss for: {} — generating new cert", domain);
         let (cert_chain, key) = self.issue_cert(domain)?;
 
-        let config = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(cert_chain, key)
-            .context("Failed to build ServerConfig")?;
+        let config = Arc::new(
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(cert_chain, key)
+                .context("Failed to build ServerConfig")?,
+        );
 
-        Ok(TlsAcceptor::from(Arc::new(config)))
+        self.cert_cache.insert(domain.to_string(), config.clone());
+        Ok(TlsAcceptor::from(config))
     }
 }

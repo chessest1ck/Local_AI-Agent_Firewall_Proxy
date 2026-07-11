@@ -19,3 +19,4 @@ ca.key
 .idea/
 .vscode/
 *.swp
+threat_feed_cache.txt

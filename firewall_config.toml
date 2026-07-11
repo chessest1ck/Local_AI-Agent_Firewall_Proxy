@@ -1,0 +1,113 @@
+# ============================================================
+# Local AI-Agent Firewall Proxy — Configuration
+# ============================================================
+
+[proxy]
+listen_addr = "127.0.0.1"
+listen_port = 8080
+
+# ── Policy ───────────────────────────────────────────────────
+[policy]
+# When an unknown host is encountered and a TTY is available:
+#   "prompt" = ask user interactively (recommended)
+#   "block"  = silently block all unknown hosts
+# When no TTY is available: always blocks regardless (fail-closed).
+unknown_host_action = "prompt"
+
+# Seconds to wait for user input before auto-denying.
+prompt_timeout_secs = 60
+
+# Block direct IP-address connections (e.g. http://1.2.3.4/).
+block_ip_literals = true
+
+# Block connections whose DNS resolves to private/reserved IPs.
+# Defends against DNS rebinding attacks.
+block_private_ips = true
+
+# ── Allowlist ────────────────────────────────────────────────
+# Only these hosts (and their subdomains) are auto-allowed.
+# Everything else triggers the unknown_host_action.
+[policy.allowlist]
+hosts = [
+    "api.openai.com",
+    "api.anthropic.com",
+    "generativelanguage.googleapis.com",
+    "api.mistral.ai",
+    "api.cohere.com",
+]
+
+# ── Threat Feed ──────────────────────────────────────────────
+# URLhaus is ONE signal — not a comprehensive blocklist.
+# Absence of a domain here does NOT mean it is safe.
+[policy.threat_feed]
+enabled = true
+url = "https://urlhaus.abuse.ch/downloads/hostfile/"
+refresh_interval_hours = 24
+# Persist last-known-good to disk for offline resilience.
+cache_path = "threat_feed_cache.txt"
+
+# ── DLP (Data Loss Prevention) ───────────────────────────────
+[policy.dlp]
+# Maximum body size (bytes) to buffer for inspection.
+max_inspect_bytes = 10485760  # 10 MB
+
+# What to do when body exceeds max_inspect_bytes:
+#   "block" = reject the request (strict DLP, zero bypass)
+#   "pass"  = allow uninspected with a warning log (availability)
+oversized_action = "block"
+
+# Decompress gzip/deflate/br bodies before inspection.
+# Post-decompression size is also capped at max_inspect_bytes
+# (decompression bomb defense).
+decompress = true
+
+# Skip DLP for non-text content types (image/*, audio/*, video/*, etc.)
+skip_binary = true
+
+[[policy.dlp.rules]]
+name = "prompt_injection"
+pattern = '(?i)ignore\s+previous\s+(instructions|prompts|rules)'
+severity = "critical"
+message = "Blocked malicious prompt (Prompt Injection attempt)"
+
+[[policy.dlp.rules]]
+name = "prompt_injection_alt"
+pattern = '(?i)disregard\s+(all\s+)?(prior|previous|above)\s+(directives|instructions|context)'
+severity = "critical"
+message = "Blocked malicious prompt (Prompt Injection attempt - alternate phrasing)"
+
+[[policy.dlp.rules]]
+name = "rsa_private_key"
+pattern = '-----BEGIN\s+(RSA\s+)?PRIVATE\s+KEY-----'
+severity = "critical"
+message = "Blocked potential RSA private key leakage"
+
+[[policy.dlp.rules]]
+name = "generic_private_key"
+pattern = '-----BEGIN\s+(EC|DSA|OPENSSH|PGP)\s+PRIVATE\s+KEY-----'
+severity = "critical"
+message = "Blocked potential private key leakage"
+
+[[policy.dlp.rules]]
+name = "openai_api_key"
+pattern = 'sk-[A-Za-z0-9]{20,}'
+severity = "high"
+message = "Blocked potential OpenAI API key leakage"
+
+[[policy.dlp.rules]]
+name = "aws_access_key"
+pattern = 'AKIA[0-9A-Z]{16}'
+severity = "high"
+message = "Blocked potential AWS access key leakage"
+
+[[policy.dlp.rules]]
+name = "github_token"
+pattern = 'gh[ps]_[A-Za-z0-9]{36,}'
+severity = "high"
+message = "Blocked potential GitHub token leakage"
+
+# ── Sandbox ──────────────────────────────────────────────────
+[sandbox]
+# Device paths to allow writes to (beyond the workspace).
+# Each path is added as an individual (literal ...) rule — NOT (subpath ...).
+allowed_write_paths = ["/dev/null", "/dev/tty", "/dev/urandom", "/dev/random"]
