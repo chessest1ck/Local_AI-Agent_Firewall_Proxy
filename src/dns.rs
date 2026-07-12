@@ -156,7 +156,11 @@ pub struct PinnedConnector {
 impl PinnedConnector {
     pub fn new() -> Result<Self> {
         let mut root_store = rustls::RootCertStore::empty();
-        for cert in rustls_native_certs::load_native_certs().expect("Failed to load native root certificates") {
+        let cert_result = rustls_native_certs::load_native_certs();
+        if cert_result.certs.is_empty() {
+            anyhow::bail!("No native root certificates found on this system");
+        }
+        for cert in cert_result.certs {
             root_store.add(cert).ok();
         }
 

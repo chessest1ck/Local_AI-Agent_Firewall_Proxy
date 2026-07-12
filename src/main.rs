@@ -100,7 +100,7 @@ async fn main() -> Result<()> {
     let listen_port = cli.port.unwrap_or(firewall_config.proxy.listen_port);
     let listen_addr: SocketAddr = format!("{}:{}", firewall_config.proxy.listen_addr, listen_port)
         .parse()
-        .expect("Invalid listen address");
+        .map_err(|e| anyhow::anyhow!("Invalid listen address in config: {}", e))?;
 
     // ── Initialize Components ───────────────────────────────────
 
@@ -277,7 +277,11 @@ async fn download_threat_feed(url: &str) -> Result<String> {
     if uri.scheme_str() == Some("https") {
         // For HTTPS, we need a TLS connection
         let mut root_store = rustls::RootCertStore::empty();
-        for cert in rustls_native_certs::load_native_certs().expect("load native certs") {
+        let cert_result = rustls_native_certs::load_native_certs();
+        if cert_result.certs.is_empty() {
+            anyhow::bail!("No native root certificates found");
+        }
+        for cert in cert_result.certs {
             root_store.add(cert).ok();
         }
         let tls_config = Arc::new(

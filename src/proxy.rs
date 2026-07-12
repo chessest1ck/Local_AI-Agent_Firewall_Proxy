@@ -21,6 +21,8 @@ pub struct ProxyHandler {
     pinned_connector: Arc<PinnedConnector>,
     prompt_timeout: Duration,
     block_private_ips: bool,
+    /// "prompt" or "block" — controls unknown-host behavior.
+    unknown_host_action: String,
 }
 
 impl ProxyHandler {
@@ -39,6 +41,7 @@ impl ProxyHandler {
             pinned_connector,
             prompt_timeout: Duration::from_secs(policy_config.prompt_timeout_secs),
             block_private_ips: policy_config.block_private_ips,
+            unknown_host_action: policy_config.unknown_host_action.clone(),
         })
     }
 
@@ -64,10 +67,7 @@ impl ProxyHandler {
         let raw_authority = match req.uri().authority() {
             Some(a) => a.to_string(),
             None => {
-                return Ok(Response::builder()
-                    .status(StatusCode::BAD_REQUEST)
-                    .body(full_body("Missing authority in CONNECT request"))
-                    .expect("response builder"));
+                return Ok(build_response(StatusCode::BAD_REQUEST, full_body("Missing authority in CONNECT request")));
             }
         };
 
@@ -76,10 +76,7 @@ impl ProxyHandler {
             Ok(hp) => hp,
             Err(e) => {
                 warn!("Malformed authority '{}': {}", raw_authority, e);
-                return Ok(Response::builder()
-                    .status(StatusCode::BAD_REQUEST)
-                    .body(full_body("Malformed authority"))
-                    .expect("response builder"));
+                return Ok(build_response(StatusCode::BAD_REQUEST, full_body("Malformed authority")));
             }
         };
         let port = port.unwrap_or(443);
@@ -201,10 +198,7 @@ impl ProxyHandler {
             Ok(a) => a,
             Err(e) => {
                 error!("DNS resolution failed for {}: {}", host, e);
-                return Ok(Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
-                    .body(full_body(&format!("DNS resolution failed: {}", e)))
-                    .expect("response builder"));
+                return Ok(build_response(StatusCode::BAD_GATEWAY, full_body(&format!("DNS resolution failed: {}", e))));
             }
         };
 
@@ -212,10 +206,7 @@ impl ProxyHandler {
             Ok(t) => t,
             Err(e) => {
                 error!("TCP connect failed for {}: {}", host, e);
-                return Ok(Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
-                    .body(empty())
-                    .expect("response builder"));
+                return Ok(build_response(StatusCode::BAD_GATEWAY, empty()));
             }
         };
 
@@ -224,10 +215,7 @@ impl ProxyHandler {
             Ok(sc) => sc,
             Err(e) => {
                 error!("HTTP handshake failed for {}: {}", host, e);
-                return Ok(Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
-                    .body(empty())
-                    .expect("response builder"));
+                return Ok(build_response(StatusCode::BAD_GATEWAY, empty()));
             }
         };
 
@@ -242,10 +230,7 @@ impl ProxyHandler {
             Ok(res) => Ok(res.map(|b| b.boxed())),
             Err(e) => {
                 error!("HTTP request failed for {}: {}", host, e);
-                Ok(Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
-                    .body(empty())
-                    .expect("response builder"))
+                Ok(build_response(StatusCode::BAD_GATEWAY, empty()))
             }
         }
     }
@@ -260,20 +245,14 @@ impl ProxyHandler {
             Ok(b) => b.to_bytes(),
             Err(e) => {
                 error!("Failed to read firewall command body: {}", e);
-                return Ok(Response::builder()
-                    .status(StatusCode::BAD_REQUEST)
-                    .body(empty())
-                    .expect("response builder"));
+                return Ok(build_response(StatusCode::BAD_REQUEST, empty()));
             }
         };
 
         let payload: serde_json::Value = match serde_json::from_slice(&body_bytes) {
             Ok(v) => v,
             Err(_) => {
-                return Ok(Response::builder()
-                    .status(StatusCode::BAD_REQUEST)
-                    .body(empty())
-                    .expect("response builder"));
+                return Ok(build_response(StatusCode::BAD_REQUEST, empty()));
             }
         };
 
@@ -318,10 +297,7 @@ impl ProxyHandler {
             Ok(Response::new(empty()))
         } else {
             info!("Command denied by user.");
-            Ok(Response::builder()
-                .status(StatusCode::FORBIDDEN)
-                .body(empty())
-                .expect("response builder"))
+            Ok(build_response(StatusCode::FORBIDDEN, empty()))
         }
     }
 
@@ -342,6 +318,15 @@ impl ProxyHandler {
             }
             HostVerdict::Unknown => {
                 info!("Unknown host: {} — checking prompt coordinator.", host);
+
+                // If policy is set to "block", skip prompting entirely
+                if self.unknown_host_action == "block" {
+                    warn!("Unknown host blocked by policy (unknown_host_action=block): {}", host);
+                    return Err(format!(
+                        "Unknown host blocked by policy: {}",
+                        host
+                    ));
+                }
 
                 if !self.prompt_coordinator.has_tty() {
                     warn!("No TTY — blocking unknown host (fail-closed): {}", host);
@@ -432,10 +417,7 @@ async fn handle_decrypted_request(
         Ok(collected) => collected.to_bytes(),
         Err(e) => {
             error!("Failed to read body: {}", e);
-            return Ok(Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(empty())
-                .expect("response builder"));
+            return Ok(build_response(StatusCode::BAD_REQUEST, empty()));
         }
     };
 
@@ -449,17 +431,11 @@ async fn handle_decrypted_request(
             let reasons: Vec<String> = violations.iter().map(|v| v.message.clone()).collect();
             let reason = reasons.join("; ");
             warn!("DLP blocked request to {}: {}", host, reason);
-            return Ok(Response::builder()
-                .status(StatusCode::FORBIDDEN)
-                .body(full_body(&format!("Blocked by Local AI Firewall (DLP): {}", reason)))
-                .expect("response builder"));
+            return Ok(build_response(StatusCode::FORBIDDEN, full_body(&format!("Blocked by Local AI Firewall (DLP): {}", reason))));
         }
         Err(DlpAction::BlockOversized) => {
             warn!("DLP blocked oversized request to {}", host);
-            return Ok(Response::builder()
-                .status(StatusCode::PAYLOAD_TOO_LARGE)
-                .body(full_body("Request body too large for DLP inspection"))
-                .expect("response builder"));
+            return Ok(build_response(StatusCode::PAYLOAD_TOO_LARGE, full_body("Request body too large for DLP inspection")));
         }
         _ => {} // No violations or pass-through
     }
@@ -470,10 +446,7 @@ async fn handle_decrypted_request(
         Ok(a) => a,
         Err(e) => {
             error!("DNS validation failed for {}: {}", host, e);
-            return Ok(Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(full_body(&format!("{}", e)))
-                .expect("response builder"));
+            return Ok(build_response(StatusCode::BAD_GATEWAY, full_body(&format!("{}", e))));
         }
     };
 
@@ -482,10 +455,7 @@ async fn handle_decrypted_request(
         Ok(s) => s,
         Err(e) => {
             error!("Upstream TLS connect failed for {}: {}", host, e);
-            return Ok(Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(empty())
-                .expect("response builder"));
+            return Ok(build_response(StatusCode::BAD_GATEWAY, empty()));
         }
     };
 
@@ -494,10 +464,7 @@ async fn handle_decrypted_request(
         Ok(sc) => sc,
         Err(e) => {
             error!("HTTP handshake over TLS failed for {}: {}", host, e);
-            return Ok(Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(empty())
-                .expect("response builder"));
+            return Ok(build_response(StatusCode::BAD_GATEWAY, empty()));
         }
     };
 
@@ -523,16 +490,19 @@ async fn handle_decrypted_request(
     let body_to_send = Full::new(body_bytes)
         .map_err(|never| match never {})
         .boxed();
-    let reconstructed_req = builder.body(body_to_send).expect("request builder");
+    let reconstructed_req = match builder.body(body_to_send) {
+        Ok(r) => r,
+        Err(e) => {
+            error!("Failed to build upstream request: {}", e);
+            return Ok(build_response(StatusCode::INTERNAL_SERVER_ERROR, full_body("Failed to construct upstream request")));
+        }
+    };
 
     match sender.send_request(reconstructed_req).await {
         Ok(res) => Ok(res.map(|b| b.boxed())),
         Err(e) => {
             error!("Upstream HTTPS request failed for {}: {}", host, e);
-            Ok(Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(empty())
-                .expect("response builder"))
+            Ok(build_response(StatusCode::BAD_GATEWAY, empty()))
         }
     }
 }
@@ -552,8 +522,20 @@ fn full_body(msg: &str) -> BoxBody<Bytes, hyper::Error> {
 }
 
 fn forbidden_response(reason: &str) -> Response<BoxBody<Bytes, hyper::Error>> {
+    build_response(StatusCode::FORBIDDEN, full_body(reason))
+}
+
+/// Safe response builder that never panics. Falls back to a minimal
+/// 500 response if the builder somehow fails (which should not happen
+/// with valid StatusCode + body, but we avoid expect() on principle).
+fn build_response(
+    status: StatusCode,
+    body: BoxBody<Bytes, hyper::Error>,
+) -> Response<BoxBody<Bytes, hyper::Error>> {
     Response::builder()
-        .status(StatusCode::FORBIDDEN)
-        .body(full_body(reason))
-        .expect("response builder")
+        .status(status)
+        .body(body)
+        .unwrap_or_else(|_| {
+            Response::new(full_body("Internal proxy error"))
+        })
 }

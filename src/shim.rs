@@ -8,6 +8,10 @@ use std::process;
 use tracing::{error, info};
 
 pub async fn run_shim(args: Vec<String>) -> Result<()> {
+    if args.is_empty() {
+        anyhow::bail!("Shim invoked with empty arguments — nothing to execute.");
+    }
+
     // 1. Send the command to the firewall proxy for approval
     let payload = serde_json::json!({
         "command": args,

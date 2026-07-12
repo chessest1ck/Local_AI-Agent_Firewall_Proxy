@@ -37,15 +37,20 @@ impl PromptCoordinator {
         let (tx, rx) = mpsc::channel::<PromptRequest>(64);
 
         // Spawn a blocking thread that owns stdin for the proxy's lifetime
-        std::thread::Builder::new()
+        match std::thread::Builder::new()
             .name("prompt-coordinator".into())
             .spawn(move || {
                 run_stdin_reader(rx);
-            })
-            .expect("Failed to spawn prompt coordinator thread");
-
-        info!("Prompt coordinator started (interactive mode).");
-        Self { sender: Some(tx) }
+            }) {
+            Ok(_) => {
+                info!("Prompt coordinator started (interactive mode).");
+                Self { sender: Some(tx) }
+            }
+            Err(e) => {
+                warn!("Failed to spawn prompt coordinator thread: {} — falling back to fail-closed.", e);
+                Self { sender: None }
+            }
+        }
     }
 
     /// Returns true if a TTY is available and prompts can be shown.
